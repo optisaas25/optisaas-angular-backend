@@ -79,16 +79,36 @@ export class ProductsService {
                 ? rawCodeBarres
                 : mainAndRelationalFields.codeInterne;
 
-            return await this.prisma.product.create({
-                data: {
-                    ...mainAndRelationalFields,
-                    // Ensure codeBarres is present (fallback to codeInterne if missing to avoid Prisma error)
-                    codeBarres: codeBarres,
-                    statut: mainAndRelationalFields.statut ?? 'DISPONIBLE',
-                    specificData: newSpecificData,
-                    utilisateurCreation: mainAndRelationalFields.utilisateurCreation || 'system'
-                },
+            // Ensure codeBarres is present (fallback to codeInterne if missing to avoid Prisma error)
+            const resolvedCodeBarres = codeBarres || (mainAndRelationalFields.codeInterne ? mainAndRelationalFields.codeInterne : null);
+
+            return await this.prisma.$transaction(async (tx) => {
+                const product = await tx.product.create({
+                    data: {
+                        ...mainAndRelationalFields,
+                        codeBarres: resolvedCodeBarres!, // Assert non-null as fallback logic handles it or schema allows
+                        statut: mainAndRelationalFields.statut ?? 'DISPONIBLE',
+                        specificData: newSpecificData,
+                        utilisateurCreation: mainAndRelationalFields.utilisateurCreation || 'system'
+                    },
+                });
+
+                if (product.quantiteActuelle > 0) {
+                    await tx.mouvementStock.create({
+                        data: {
+                            type: 'INVENTAIRE',
+                            quantite: product.quantiteActuelle,
+                            produitId: product.id,
+                            entrepotDestinationId: product.entrepotId,
+                            motif: 'Stock Initial (Création Fiche)',
+                            utilisateur: product.utilisateurCreation || 'System'
+                        }
+                    });
+                }
+
+                return product;
             });
+
         } catch (error) {
             console.error('Error creating product:', error);
             // Log deep details if available
@@ -103,16 +123,14 @@ export class ProductsService {
         const where: any = {};
 
         if (!centreId && !entrepotId && !globalSearch) return []; // Isolation
-        if (entrepotId) where.entrepotId = entrepotId;
+        if (entrepotId) {
+            where.entrepotId = entrepotId;
+        } else if (!globalSearch && centreId) {
+            where.entrepot = { centreId };
+        }
 
-        // Only apply centre scope if NOT a global search
-        // For performance, we still want to limit but we must include items targeting this centre
-        // Since Prisma OR with JSON path is tricky, we fetch items from current centre OR all reserved/in-transit
-        // and filter in memory.
         const products = await this.prisma.product.findMany({
-            where: globalSearch ? {} : {
-                entrepot: { centreId }
-            },
+            where,
             orderBy: { createdAt: 'desc' },
             include: {
                 entrepot: {
@@ -246,8 +264,47 @@ export class ProductsService {
     }
 
     async remove(id: string) {
-        // Check if exists
-        await this.findOne(id);
+        const product = await this.prisma.product.findUnique({
+            where: { id },
+            include: {
+                mouvements: { take: 1 },
+                _count: {
+                    select: { mouvements: true }
+                }
+            }
+        });
+
+        if (!product) {
+            throw new NotFoundException(`Produit non trouvé`);
+        }
+
+        // 1. Check for Stock
+        if (product.quantiteActuelle > 0) {
+            throw new Error(`Suppression impossible : ce produit possède encore du stock (${product.quantiteActuelle}). Veuillez d'abord sortir le stock manuellement.`);
+        }
+
+        // 2. Check for Mouvements (History)
+        if (product._count.mouvements > 0) {
+            throw new Error(`Suppression impossible : ce produit possède un historique de mouvements de stock (${product._count.mouvements}). Pour la traçabilité, vous ne pouvez pas le supprimer.`);
+        }
+
+        // 3. Check for Invoices (JSON probe)
+        // Since Prisma doesn't support easy JsonPath filtering across all dialects in a simple way,
+        // we can use a more generic check or findMany but that's expensive.
+        // However, given the requirement, we MUST ensure it's not used.
+        const allInvoices = await this.prisma.facture.findMany({
+            select: { id: true, numero: true, lignes: true }
+        });
+
+        const linkedInvoice = allInvoices.find(inv => {
+            const lines = (typeof inv.lignes === 'string' ? JSON.parse(inv.lignes) : inv.lignes) as any[];
+            return lines.some(line => line.productId === id);
+        });
+
+        if (linkedInvoice) {
+            throw new Error(`Suppression impossible : ce produit est référencé dans la facture ${linkedInvoice.numero}.`);
+        }
+
         return this.prisma.product.delete({
             where: { id },
         });
@@ -264,7 +321,10 @@ export class ProductsService {
         });
 
         if (!sourceProduct || !targetProduct) throw new NotFoundException('Source or Target product not found');
+        if (sourceProductId === targetProductId) throw new Error('Impossible de transférer un produit vers lui-même (Source = Destination).');
         if (sourceProduct.quantiteActuelle < quantite) throw new Error('Stock insuffisant à la source');
+
+        console.log(`[TRANSFER] Init from ${sourceProduct.entrepot?.centre?.nom} (${sourceProductId}) to ${targetProduct.entrepot?.centre?.nom} (${targetProductId}) Qty: ${quantite}`);
 
         const targetSpecificData = (targetProduct.specificData as any) || {};
         const updatedTargetData = {
@@ -367,13 +427,17 @@ export class ProductsService {
 
         if (!sourceProductId) throw new Error('Informations de source manquantes');
 
+        const quantiteARendre = targetSd.pendingIncoming?.quantite || 1;
         const { pendingIncoming: _, ...cleanedTargetSd } = targetSd;
 
         return this.prisma.$transaction(async (tx) => {
-            // Return 1 unit to source
+            // Return N units to source
             await tx.product.update({
                 where: { id: sourceProductId },
-                data: { quantiteActuelle: { increment: 1 } }
+                data: {
+                    quantiteActuelle: { increment: quantiteARendre },
+                    statut: 'DISPONIBLE' // Assuming stock becomes > 0, or at least not reserved. Ideally check.
+                }
             });
 
             // Clean source metadata
@@ -389,10 +453,21 @@ export class ProductsService {
                 }
             }
 
-            // Clear target metadata
+            // Clear target metadata and reset status
+            // We need to check current stock to decide status?
+            // Since we are un-reserving, and assuming we didn't add stock yet (since it wasn't received).
+            // If stock is 0, it should be RUPTURE. If stock > 0, DISPONIBLE.
+            // But we can't easily check stock inside update without fetch.
+            // So let's fetch first? Or blindly set based on fetching targetProduct before.
+
+            const newStatus = targetProduct.quantiteActuelle > 0 ? 'DISPONIBLE' : 'RUPTURE';
+
             return tx.product.update({
                 where: { id: targetProductId },
-                data: { specificData: cleanedTargetSd }
+                data: {
+                    specificData: cleanedTargetSd,
+                    statut: newStatus
+                }
             });
         });
     }
@@ -446,7 +521,9 @@ export class ProductsService {
                     quantite: quantiteRecue,
                     produitId: targetProductId,
                     entrepotDestinationId: targetProduct.entrepotId,
-                    motif: 'Confirmation réception transfert',
+                    prixAchatUnitaire: targetProduct.prixAchatHT,
+                    prixVenteUnitaire: targetProduct.prixVenteTTC,
+                    motif: 'Réception',
                     utilisateur: 'System'
                 }
             });
@@ -458,6 +535,7 @@ export class ProductsService {
             return {
                 totalProduits: 0,
                 valeurStockTotal: 0,
+                caNonConsolide: 0,
                 produitsStockBas: 0,
                 produitsRupture: 0,
                 produitsReserves: 0,
@@ -471,29 +549,74 @@ export class ProductsService {
         });
 
         const stats = {
-            totalProduits: allProducts.reduce((acc, p) => acc + p.quantiteActuelle, 0),
-            valeurStockTotal: allProducts.reduce((acc, p) => acc + (p.quantiteActuelle * (p.prixAchatHT || 0)), 0),
-            caNonConsolide: allProducts.reduce((acc, p) => {
-                const isDefective = p.entrepot?.nom?.toLowerCase().includes('défectueux') ||
-                    p.entrepot?.nom?.toLowerCase().includes('defectueux') ||
-                    p.entrepot?.nom?.toUpperCase() === 'DÉFECTUEUX';
-
-                if (isDefective) {
-                    return acc + (p.quantiteActuelle * (p.prixVenteTTC || 0));
-                }
-                return acc;
-            }, 0),
-            produitsStockBas: allProducts.filter(p => p.quantiteActuelle > 0 && p.quantiteActuelle <= p.seuilAlerte).length,
-            produitsRupture: allProducts.filter(p => p.quantiteActuelle <= 0).length,
-            produitsReserves: allProducts.filter(p => (p.specificData as any)?.pendingIncoming?.status === 'RESERVED').length,
-            produitsEnTransit: allProducts.filter(p => (p.specificData as any)?.pendingIncoming?.status === 'SHIPPED').length
+            totalProduits: 0,
+            valeurStockTotal: 0,
+            caNonConsolide: 0,
+            produitsStockBas: 0,
+            produitsRupture: 0,
+            produitsReserves: 0,
+            produitsEnTransit: 0
         };
+
+        allProducts.forEach(p => {
+            const isDefective = p.entrepot?.nom?.toLowerCase().includes('défectueux') ||
+                p.entrepot?.nom?.toLowerCase().includes('defectueux') ||
+                p.entrepot?.nom?.toUpperCase() === 'DÉFECTUEUX';
+
+            if (isDefective) {
+                stats.caNonConsolide += (p.quantiteActuelle * (p.prixVenteHT || 0));
+            } else {
+                // Main stats only for salable stock
+                stats.totalProduits += p.quantiteActuelle;
+                stats.valeurStockTotal += (p.quantiteActuelle * (p.prixAchatHT || 0));
+
+                if (p.quantiteActuelle > 0 && p.quantiteActuelle <= p.seuilAlerte) {
+                    stats.produitsStockBas++;
+                }
+
+                if (p.quantiteActuelle <= 0) {
+                    stats.produitsRupture++;
+                }
+
+                const sd = (p.specificData as any) || {};
+                if (sd.pendingIncoming?.status === 'RESERVED') {
+                    stats.produitsReserves++;
+                }
+                if (sd.pendingIncoming?.status === 'SHIPPED') {
+                    stats.produitsEnTransit++;
+                }
+            }
+        });
 
         return stats;
     }
 
     async restock(id: string, quantite: number, motif: string, utilisateur: string = 'System', prixAchatHT?: number, remiseFournisseur?: number) {
-        // ... (existing implementation)
+        const product = await this.prisma.product.findUnique({ where: { id } });
+        if (!product) throw new NotFoundException('Produit non trouvé');
+
+        return this.prisma.$transaction(async (tx) => {
+            await tx.product.update({
+                where: { id },
+                data: {
+                    quantiteActuelle: { increment: quantite },
+                    ...(prixAchatHT !== undefined && { prixAchatHT }),
+                    ...(remiseFournisseur !== undefined && { remiseFournisseur })
+                }
+            });
+
+            return tx.mouvementStock.create({
+                data: {
+                    type: 'ENTREE_ACHAT',
+                    quantite: quantite,
+                    produitId: id,
+                    entrepotDestinationId: product.entrepotId,
+                    motif: motif,
+                    utilisateur: utilisateur,
+                    ...(prixAchatHT !== undefined && { prixAchatUnitaire: prixAchatHT })
+                }
+            });
+        });
     }
 
     async destock(id: string, quantite: number, motif: string, destinationEntrepotId?: string, utilisateur: string = 'System') {
@@ -569,12 +692,13 @@ export class ProductsService {
             });
 
             // 5. If destination provided (or automated), handle the entry there
+            let targetProduct: any = null;
             if (effectiveDestinationId) {
                 const destinationWh = await tx.entrepot.findUnique({ where: { id: effectiveDestinationId } });
                 const isCrossCenter = destinationWh && destinationWh.centreId !== product.entrepot.centreId;
 
                 // Find or create product in target warehouse
-                let targetProduct = await tx.product.findFirst({
+                targetProduct = await tx.product.findFirst({
                     where: { codeInterne: product.codeInterne, entrepotId: effectiveDestinationId }
                 });
 
@@ -645,7 +769,7 @@ export class ProductsService {
                         produitId: targetProduct.id,
                         entrepotSourceId: product.entrepotId,
                         entrepotDestinationId: effectiveDestinationId,
-                        motif: `Transfert depuis ${product.entrepot.nom}: ${motif}`,
+                        motif: 'Transfert',
                         utilisateur: utilisateur,
                         prixAchatUnitaire: product.prixAchatHT,
                         prixVenteUnitaire: product.prixVenteTTC
@@ -653,7 +777,7 @@ export class ProductsService {
                 });
             }
 
-            return updatedProduct;
+            return { source: updatedProduct, target: targetProduct };
         });
     }
 }

@@ -177,8 +177,7 @@ export class SalesControlService {
             countValid: 0,
             countAvoir: 0,
             countCancelled: 0,
-            totalAmount: 0,
-            totalArchived: 0
+            totalAmount: 0
         }];
         where.centreId = centreId;
 
@@ -198,17 +197,19 @@ export class SalesControlService {
         const withPayment = factures.filter(f => (f.numero.startsWith('BRO') || f.numero.startsWith('Devis') || f.numero.startsWith('DEV')) && f.paiements && f.paiements.length > 0 && f.statut !== 'ARCHIVE' && f.statut !== 'ANNULEE');
         const withoutPayment = factures.filter(f => (f.numero.startsWith('BRO') || f.numero.startsWith('Devis') || f.numero.startsWith('DEV')) && (!f.paiements || f.paiements.length === 0) && f.statut !== 'ARCHIVE' && f.statut !== 'ANNULEE');
 
-        // Valid Invoices: Must have FAC prefix
-        const validInvoices = factures.filter(f => f.numero.startsWith('FAC') && f.type === 'FACTURE');
-
+        // Valid Invoices: Must have FAC prefix and not be cancelled
+        const validInvoices = factures.filter(f => f.numero.startsWith('FAC') && f.type === 'FACTURE' && f.statut !== 'ANNULEE');
         // Avoirs: Show all having type AVOIR
         const avoirs = factures.filter(f => f.type === 'AVOIR');
-
         // Cancelled Drafts (Traceability)
         const cancelledDrafts = factures.filter(f => f.statut === 'ANNULEE' && (f.numero.startsWith('BRO') || f.numero.startsWith('Devis')));
 
-        // Archived Invoices (Undeclared Revenue)
-        const archivedInvoices = factures.filter(f => f.statut === 'ARCHIVE');
+        // Valid Invoices + Avoirs for CA Calculation
+        // Formula: sum(totalTTC) of all non-draft invoices, including those balanced by Avoirs
+        const caRelevant = factures.filter(f =>
+            (f.numero.startsWith('FAC') || f.type === 'AVOIR') &&
+            f.statut !== 'ARCHIVE'
+        );
 
         return [{
             vendorId: 'all',
@@ -218,38 +219,10 @@ export class SalesControlService {
             countValid: validInvoices.length,
             countAvoir: avoirs.length,
             countCancelled: cancelledDrafts.length,
-            totalAmount: validInvoices.reduce((sum, f) => sum + (f.totalTTC || 0), 0),
-            totalArchived: archivedInvoices.reduce((sum, f) => sum + (f.totalTTC || 0), 0)
+            totalAmount: caRelevant.reduce((sum, f) => sum + (f.totalTTC || 0), 0)
         }];
     }
 
-    // Get ARCHIVED invoices (for calculation but hidden from lists)
-    async getArchivedInvoices(userId?: string, centreId?: string) {
-        const where: any = {
-            statut: 'ARCHIVE'
-        };
-
-        if (!centreId) return [];
-        where.centreId = centreId;
-
-        return this.prisma.facture.findMany({
-            where,
-            include: {
-                client: {
-                    select: {
-                        nom: true,
-                        prenom: true,
-                        raisonSociale: true
-                    }
-                },
-                paiements: true,
-                fiche: true
-            },
-            orderBy: {
-                dateEmission: 'desc'
-            }
-        });
-    }
 
     // Validate a BROUILLON invoice
     async validateInvoice(id: string) {
@@ -265,33 +238,6 @@ export class SalesControlService {
         });
     }
 
-    // Archive a BROUILLON invoice (Undeclared Sale)
-    async archiveInvoice(id: string) {
-        const facture = await this.prisma.facture.findUnique({
-            where: { id },
-            include: { paiements: true } // Check payments?
-        });
-
-        if (!facture) {
-            throw new Error('Facture not found');
-        }
-
-        // Logic check: Only allow if fully paid? Or mixed?
-        // User said: "une fois le devis recois un paiement"
-        // We assume logic is usually "Paid" but system allows action.
-
-        return this.prisma.facture.update({
-            where: { id },
-            data: {
-                statut: 'ARCHIVE',
-                proprietes: {
-                    ...(facture.proprietes as any || {}),
-                    dateArchivage: new Date(),
-                    raison: 'Vente non déclarée (Stock Secondaire)'
-                }
-            }
-        });
-    }
 
     // Declare as gift (create 0 DH invoice)
     async declareAsGift(id: string) {
@@ -333,14 +279,12 @@ export class SalesControlService {
                 withoutPayments,
                 valid,
                 avoirs,
-                archived,
                 stats
             ] = await Promise.all([
                 this.getBrouillonWithPayments(userId, centreId),
                 this.getBrouillonWithoutPayments(userId, centreId),
                 this.getValidInvoices(userId, centreId),
                 this.getAvoirs(userId, centreId),
-                this.getArchivedInvoices(userId, centreId),
                 this.getStatisticsByVendor(centreId)
             ]);
 
@@ -352,7 +296,6 @@ export class SalesControlService {
                 withoutPayments,
                 valid,
                 avoirs,
-                archived,
                 stats
             };
         } catch (error) {
